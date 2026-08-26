@@ -3,6 +3,10 @@ import pandas as pd
 from supabase import create_client
 from io import BytesIO
 import math
+import re
+import unicodedata
+from difflib import SequenceMatcher
+from collections import Counter
 from datetime import date, timedelta
 
 
@@ -14,7 +18,7 @@ st.set_page_config(
     page_title="HiDevs Data Explorer",
     page_icon="📊",
     layout="wide",
-    initial_sidebar_state="expanded",
+    initial_sidebar_state="collapsed",
 )
 
 
@@ -87,7 +91,10 @@ st.markdown(
     }
 
     section[data-testid="stSidebar"] {
-        background: linear-gradient(180deg, #0f172a 0%, #172554 100%);
+        display: none !important;
+    }
+    button[data-testid="stSidebarCollapsedControl"] {
+        display: none !important;
     }
 
     section[data-testid="stSidebar"] label {
@@ -180,23 +187,9 @@ st.markdown(
     unsafe_allow_html=True,
 )
 st.markdown(
-    '<div class="subtitle">Luma Registration & Master Data Dashboard &nbsp;•&nbsp; Supabase Connected</div>',
+    '<div class="subtitle">Single Unified Dashboard &nbsp;•&nbsp; Luma + Master &nbsp;•&nbsp; Unique People Only &nbsp;•&nbsp; Supabase Connected</div>',
     unsafe_allow_html=True,
 )
-
-st.sidebar.markdown(
-    """
-    <h2 style="margin-bottom:5px;">HiDevs</h2>
-    <p style="opacity:0.75;">Data Explorer</p>
-    """,
-    unsafe_allow_html=True,
-)
-
-dashboard = st.sidebar.radio(
-    "Dashboard",
-    ["Luma Registration Data", "Master Data"],
-)
-
 
 # ============================================================
 # HELPERS
@@ -242,16 +235,30 @@ def make_excel(df, sheet_name="Data"):
 
 
 @st.cache_data(ttl=300, show_spinner=False)
-def load_table(table_name):
+def load_table(table_name, order_column=None):
+    """Load a Supabase table with deterministic pagination.
+
+    IMPORTANT: PostgREST range pagination without an ORDER BY is not stable.
+    That can cause later pages to repeat some rows and skip others even when
+    the final DataFrame length looks correct. For Luma we therefore paginate
+    in ascending primary-key order (id).
+    """
     all_rows = []
     page_size = 1000
     start = 0
 
     while True:
-        response = (
+        query = (
             supabase
             .table(table_name)
             .select("*")
+        )
+
+        if order_column:
+            query = query.order(order_column, desc=False)
+
+        response = (
+            query
             .range(start, start + page_size - 1)
             .execute()
         )
@@ -269,7 +276,15 @@ def load_table(table_name):
         if start >= 100000:
             break
 
-    return pd.DataFrame(all_rows)
+    result = pd.DataFrame(all_rows)
+
+    # Defensive check for the Luma primary key. If pagination ever returns
+    # overlapping pages, keep one row per id rather than allowing duplicate
+    # pages to distort filter counts.
+    if order_column == "id" and "id" in result.columns:
+        result = result.drop_duplicates(subset=["id"], keep="first").reset_index(drop=True)
+
+    return result
 
 
 def apply_exact_filter(df, column, selected):
@@ -290,736 +305,1144 @@ def unique_email_count(df):
     return s.nunique()
 
 
-# ============================================================
-# LUMA REGISTRATION DATA
-# ============================================================
+def _text_key(value):
+    """Comparable lowercase key used by Master-data cleaners."""
+    if value is None or pd.isna(value):
+        return ""
+    text = unicodedata.normalize("NFKC", str(value)).strip()
+    text = re.sub(r"\s+", " ", text)
+    return text.lower()
 
-if dashboard == "Luma Registration Data":
 
-    st.markdown(
-        '<div class="section-title">👥 Luma Registration Dashboard</div>',
-        unsafe_allow_html=True,
+MASTER_CITY_ALIASES = {
+    # Bengaluru
+    "bangalore": "Bengaluru",
+    "banglore": "Bengaluru",
+    "bangaluru": "Bengaluru",
+    "bengalore": "Bengaluru",
+    "bengluru": "Bengaluru",
+    "bamgalore": "Bengaluru",
+    "banaglore": "Bengaluru",
+    "banagmore": "Bengaluru",
+    "banagluru": "Bengaluru",
+    "benagluru": "Bengaluru",
+    "bengalaru": "Bengaluru",
+    "begaluru": "Bengaluru",
+    "banglalore": "Bengaluru",
+    "benguluru": "Bengaluru",
+    "bengaluru urban": "Bengaluru",
+
+    # Bengaluru localities
+    "whitefield": "Bengaluru",
+    "marathahalli": "Bengaluru",
+    "marathalli": "Bengaluru",
+    "koramangala": "Bengaluru",
+    "hsr": "Bengaluru",
+    "hsr layout": "Bengaluru",
+    "electronic city": "Bengaluru",
+    "btm": "Bengaluru",
+    "btm layout": "Bengaluru",
+    "banashankari": "Bengaluru",
+    "jayanagar": "Bengaluru",
+    "indiranagar": "Bengaluru",
+    "hebbal": "Bengaluru",
+    "yelahanka": "Bengaluru",
+    "mahadevapura": "Bengaluru",
+    "adugodi": "Bengaluru",
+    "devarbisanahalli": "Bengaluru",
+    "bommanahalli": "Bengaluru",
+    "boomanahalli": "Bengaluru",
+    "boomanhali": "Bengaluru",
+    "attiguppe": "Bengaluru",
+    "dasarhali": "Bengaluru",
+    "dasarahalli": "Bengaluru",
+    "hulimavu": "Bengaluru",
+    "madiwala": "Bengaluru",
+
+    # Hyderabad + localities
+    "hydrabad": "Hyderabad",
+    "hyderbad": "Hyderabad",
+    "hydrebad": "Hyderabad",
+    "secunderabad": "Hyderabad",
+    "secunderābād": "Hyderabad",
+    "gachibowli": "Hyderabad",
+    "madhapur": "Hyderabad",
+    "hitech city": "Hyderabad",
+    "financial district": "Hyderabad",
+    "kukatpally": "Hyderabad",
+    "serilingampally": "Hyderabad",
+    "banjara hills": "Hyderabad",
+    "bachupalle": "Hyderabad",
+    "khairatabad": "Hyderabad",
+    "l.b.nagar": "Hyderabad",
+    "nizampet": "Hyderabad",
+    "shamshabad": "Hyderabad",
+
+    # Pune + localities
+    "hinjewadi": "Pune",
+    "wakad": "Pune",
+    "kharadi": "Pune",
+    "akurdi": "Pune",
+    "baner gaon": "Pune",
+
+    # Mumbai + localities
+    "bombay": "Mumbai",
+    "worli": "Mumbai",
+    "andheri": "Mumbai",
+    "bandra": "Mumbai",
+    "powai": "Mumbai",
+    "borivali": "Mumbai",
+
+    # Common Indian spelling variants
+    "gurgaon": "Gurugram",
+    "mysore": "Mysuru",
+    "mangalore": "Mangaluru",
+    "mangluru": "Mangaluru",
+    "belgaum": "Belagavi",
+    "belgavi": "Belagavi",
+    "calcutta": "Kolkata",
+    "cochin": "Kochi",
+    "trivandrum": "Thiruvananthapuram",
+    "thiruvanthapuram": "Thiruvananthapuram",
+    "vizag": "Visakhapatnam",
+    "visakhapatanam": "Visakhapatnam",
+    "ahemdabad": "Ahmedabad",
+    "ahmadabad": "Ahmedabad",
+    "bhubaneshwar": "Bhubaneswar",
+    "gandhi nagar": "Gandhinagar",
+    "chinthamani": "Chintamani",
+    "chintamni": "Chintamani",
+    "chikballapur": "Chikkaballapur",
+    "chickballapur": "Chikkaballapur",
+    "chikaballapur": "Chikkaballapur",
+    "chitoor": "Chittoor",
+    "chittor": "Chittoor",
+    "ballabgarh": "Ballabhgarh",
+    "madanapalli": "Madanapalle",
+    "madanapally": "Madanapalle",
+
+    # International spelling / duplicate variants
+    "new york city": "New York",
+    "nyc": "New York",
+    "ny": "New York",
+    "bankok": "Bangkok",
+    "bangkok city": "Bangkok",
+    "san josé": "San Jose",
+}
+
+
+MASTER_CITY_NOT_CITY = {
+    # Countries
+    "india", "united states", "usa", "us", "united kingdom", "uk",
+    "canada", "australia", "singapore country",
+
+    # Indian states / regions
+    "karnataka", "maharashtra", "gujarat", "rajasthan", "kerala",
+    "telangana", "tamil nadu", "tamilnadu", "uttar pradesh",
+    "madhya pradesh", "andhra pradesh", "west bengal", "punjab",
+    "haryana", "odisha", "bihar", "assam", "uttarakhand", "uttrakhand",
+
+    # Non-city business/profile values seen in Master data
+    "banking", "financial services", "software development",
+    "information technology & services", "it services and it consulting",
+    "remote", "remote (india)", "world university centre",
+    "dharmaram college", "technology, information and internet",
+    "partnership (data analytics software)",
+}
+
+
+MASTER_CITY_BAD_KEYWORDS = (
+    "university", " college", "college ", "school", "institute",
+    "technologies", "technology", "software", "solutions", "services",
+    "consulting", "private limited", "pvt ltd", " corporation",
+    "company", "hostel", "apartment", "building", "road no",
+    "street", "near ", "opposite ", "floor", "campus",
+)
+
+
+def canonical_master_city(value):
+    """Return one city name or Not Specified.
+
+    The Master City filter intentionally excludes Not Specified, so addresses,
+    states, countries, companies, industries and malformed strings never become
+    dropdown options.
+    """
+    if value is None or pd.isna(value):
+        return "Not Specified"
+
+    text = unicodedata.normalize("NFKC", str(value)).strip()
+    text = re.sub(r"\s+", " ", text)
+
+    if not text:
+        return "Not Specified"
+
+    # Encoding corruption / URLs / email / numeric addresses.
+    if "�" in text or "http://" in text.lower() or "https://" in text.lower() or "@" in text:
+        return "Not Specified"
+    if re.search(r"\d{4,}", text):
+        return "Not Specified"
+
+    key = text.lower().strip(" .,-_/")
+
+    if not key or key in MASTER_CITY_NOT_CITY:
+        return "Not Specified"
+
+    if any(keyword in f" {key} " for keyword in MASTER_CITY_BAD_KEYWORDS):
+        return "Not Specified"
+
+    # Known aliases/localities first.
+    if key in MASTER_CITY_ALIASES:
+        return MASTER_CITY_ALIASES[key]
+
+    # Remove state/country suffixes.  Example:
+    # Hyderabad, Telangana, India -> Hyderabad
+    # Bhilwara, Rajasthan -> Bhilwara
+    if "," in text:
+        parts = [p.strip() for p in text.split(",") if p.strip()]
+        if len(parts) >= 2:
+            first_key = parts[0].lower().strip(" .,-_/")
+            if first_key in MASTER_CITY_ALIASES:
+                return MASTER_CITY_ALIASES[first_key]
+            if (
+                first_key
+                and first_key not in MASTER_CITY_NOT_CITY
+                and not any(k in f" {first_key} " for k in MASTER_CITY_BAD_KEYWORDS)
+                and not re.search(r"\d", first_key)
+            ):
+                text = parts[0].strip()
+                key = first_key
+
+    # Remove obvious "<city> state/country" suffixes without commas.
+    state_suffixes = (
+        " karnataka", " maharashtra", " gujarat", " rajasthan",
+        " telangana", " tamil nadu", " tamilnadu", " uttar pradesh",
+        " madhya pradesh", " andhra pradesh", " west bengal",
+        " punjab", " haryana", " odisha", " bihar", " kerala",
+        " india",
     )
-
-    # Manual refresh addresses the CEO's data-freshness concern.
-    refresh_col, info_col = st.columns([1, 4])
-    with refresh_col:
-        if st.button("🔄 Refresh Luma Data", use_container_width=True):
-            st.cache_data.clear()
-            st.rerun()
-
-    try:
-        with st.spinner("Loading cleaned Luma data from Supabase..."):
-            df = load_table("luma_registrations_clean")
-    except Exception as e:
-        st.error("Could not load cleaned Luma Data from Supabase.")
-        st.exception(e)
-        st.stop()
-
-    if df.empty:
-        st.warning('The "luma_registrations_clean" table returned no records.')
-        st.stop()
-
-    # --------------------------------------------------------
-    # DATA TYPES / BASIC NORMALIZATION
-    # --------------------------------------------------------
-    for col in df.columns:
-        if df[col].dtype == "object":
-            df[col] = df[col].apply(lambda x: x.strip() if isinstance(x, str) else x)
-
-    if "event_date_clean" in df.columns:
-        df["event_date_clean"] = pd.to_datetime(df["event_date_clean"], errors="coerce").dt.date
-
-    if "imported_at" in df.columns:
-        df["imported_at_dt"] = pd.to_datetime(df["imported_at"], errors="coerce", utc=True)
-    else:
-        df["imported_at_dt"] = pd.NaT
-
-    latest_import = df["imported_at_dt"].max()
-    latest_event_date = df["event_date_clean"].max() if "event_date_clean" in df.columns else None
-
-    with info_col:
-        latest_import_text = (
-            latest_import.strftime("%d %b %Y, %I:%M %p UTC")
-            if pd.notna(latest_import)
-            else "Unavailable"
-        )
-        st.markdown(
-            f"""
-            <div class="info-card">
-                <b>Clean Luma source:</b> luma_registrations_clean<br>
-                <b>Records:</b> {len(df):,} &nbsp; • &nbsp;
-                <b>Latest event date:</b> {latest_event_date or 'Unavailable'} &nbsp; • &nbsp;
-                <b>Dataset imported:</b> {latest_import_text}
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-
-    # --------------------------------------------------------
-    # SIDEBAR FILTERS
-    # --------------------------------------------------------
-    st.sidebar.markdown("---")
-    st.sidebar.markdown("### 🔎 Luma Filters")
-    st.sidebar.caption("Filters use the cleaned Supabase fields.")
-
-    # Date filter
-    date_mode = st.sidebar.selectbox(
-        "Event Date",
-        ["All Dates", "Today", "Last 7 Days", "Last 30 Days", "This Month", "Custom Date Range"],
-        key="luma_date_mode",
-    )
-
-    min_date = df["event_date_clean"].min() if "event_date_clean" in df.columns else None
-    max_date = df["event_date_clean"].max() if "event_date_clean" in df.columns else None
-
-    date_start = None
-    date_end = None
-
-    if date_mode == "Today":
-        date_start = date.today()
-        date_end = date.today()
-    elif date_mode == "Last 7 Days":
-        date_end = date.today()
-        date_start = date_end - timedelta(days=6)
-    elif date_mode == "Last 30 Days":
-        date_end = date.today()
-        date_start = date_end - timedelta(days=29)
-    elif date_mode == "This Month":
-        today = date.today()
-        date_start = today.replace(day=1)
-        date_end = today
-    elif date_mode == "Custom Date Range" and min_date is not None and max_date is not None:
-        selected_range = st.sidebar.date_input(
-            "Choose custom range",
-            value=(min_date, max_date),
-            min_value=min_date,
-            max_value=max_date,
-            key="luma_custom_date",
-        )
-        if isinstance(selected_range, (tuple, list)) and len(selected_range) == 2:
-            date_start, date_end = selected_range
-
-    # Category
-    selected_category = st.sidebar.selectbox(
-        "User Category",
-        ["All"] + safe_unique(df, "user_category_clean"),
-        key="luma_user_category",
-    )
-
-    # Event
-    event_options = ["All"] + safe_unique(df, "luma_event_name_clean")
-    selected_event = st.sidebar.selectbox(
-        "Event",
-        event_options,
-        key="luma_event",
-    )
-
-    # Event Type is dependent on the selected event so an invalid combination
-    # cannot silently reduce the result set.
-    event_type_source = df
-    if selected_event != "All":
-        event_type_source = event_type_source[
-            event_type_source["luma_event_name_clean"].fillna("").astype(str).str.strip() == selected_event
-        ]
-
-    event_type_options = ["All"] + safe_unique(event_type_source, "luma_event_type_clean")
-    selected_event_type = st.sidebar.selectbox(
-        "Event Type",
-        event_type_options,
-        key="luma_event_type",
-        help="When an Event is selected, only event types belonging to that event are shown.",
-    )
-
-    # Mode can also depend on selected event + type.
-    mode_source = event_type_source
-    if selected_event_type != "All":
-        mode_source = mode_source[
-            mode_source["luma_event_type_clean"].fillna("").astype(str).str.strip() == selected_event_type
-        ]
-
-    selected_event_mode = st.sidebar.selectbox(
-        "Event Mode",
-        ["All"] + safe_unique(mode_source, "event_mode_clean"),
-        key="luma_event_mode",
-    )
-
-    selected_city = st.sidebar.selectbox(
-        "City",
-        ["All"] + safe_unique(df, "city_clean"),
-        key="luma_city",
-    )
-
-    selected_designation = st.sidebar.selectbox(
-        "Designation",
-        ["All"] + safe_unique(df, "designation_clean_filter"),
-        key="luma_designation",
-    )
-
-    selected_are_you = st.sidebar.selectbox(
-        "Are You",
-        ["All"] + safe_unique(df, "are_you_clean"),
-        key="luma_are_you",
-    )
-
-    selected_domain_group = st.sidebar.selectbox(
-        "Email Domain",
-        ["All"] + safe_unique(df, "email_domain_group"),
-        key="luma_email_domain_group",
-        help="Gmail = @gmail.com. Other Domain = every other valid email domain.",
-    )
-
-    # Existing source flag - clearly named so it is not confused with the
-    # future external email verification workflow.
-    selected_valid_email = st.sidebar.selectbox(
-        "Existing Valid Email Flag",
-        ["All"] + safe_unique(df, "valid_email_clean"),
-        key="luma_valid_email",
-        help=(
-            "This is the existing value present in the source Luma dataset. "
-            "It is not the new external email-verification result."
-        ),
-    )
-
-    selected_verification = st.sidebar.selectbox(
-        "External Verification Status",
-        ["All"] + safe_unique(df, "email_verification_status"),
-        key="luma_external_verification",
-        help="This will be updated when the externally verified CSV workflow is connected.",
-    )
-
-    search_text = st.sidebar.text_input(
-        "Search",
-        placeholder="Search name, email, company or LinkedIn",
-        key="luma_search",
-    )
-
-    # --------------------------------------------------------
-    # APPLY FILTERS ON CLEAN COLUMNS
-    # --------------------------------------------------------
-    filtered_df = df.copy()
-
-    if date_start is not None and date_end is not None and "event_date_clean" in filtered_df.columns:
-        filtered_df = filtered_df[
-            filtered_df["event_date_clean"].notna()
-            & (filtered_df["event_date_clean"] >= date_start)
-            & (filtered_df["event_date_clean"] <= date_end)
-        ]
-
-    filtered_df = apply_exact_filter(filtered_df, "user_category_clean", selected_category)
-    filtered_df = apply_exact_filter(filtered_df, "luma_event_name_clean", selected_event)
-    filtered_df = apply_exact_filter(filtered_df, "luma_event_type_clean", selected_event_type)
-    filtered_df = apply_exact_filter(filtered_df, "event_mode_clean", selected_event_mode)
-    filtered_df = apply_exact_filter(filtered_df, "city_clean", selected_city)
-    filtered_df = apply_exact_filter(filtered_df, "designation_clean_filter", selected_designation)
-    filtered_df = apply_exact_filter(filtered_df, "are_you_clean", selected_are_you)
-    filtered_df = apply_exact_filter(filtered_df, "email_domain_group", selected_domain_group)
-    filtered_df = apply_exact_filter(filtered_df, "valid_email_clean", selected_valid_email)
-    filtered_df = apply_exact_filter(filtered_df, "email_verification_status", selected_verification)
-
-    if search_text.strip():
-        search = search_text.strip().lower()
-        searchable_columns = [
-            "first_name",
-            "last_name",
-            "email",
-            "email_clean",
-            "company_name",
-            "linkedin",
-            "designation",
-            "designation_clean_filter",
-        ]
-
-        mask = pd.Series(False, index=filtered_df.index)
-        for col in searchable_columns:
-            if col in filtered_df.columns:
-                mask |= (
-                    filtered_df[col]
-                    .fillna("")
-                    .astype(str)
-                    .str.lower()
-                    .str.contains(search, regex=False, na=False)
-                )
-        filtered_df = filtered_df[mask]
-
-    # --------------------------------------------------------
-    # OVERVIEW
-    # --------------------------------------------------------
-    st.markdown('<div class="section-title">📈 Overview</div>', unsafe_allow_html=True)
-
-    total_records = len(df)
-    unique_users = unique_email_count(df)
-
-    category_counts_series = (
-        df["user_category_clean"].fillna("No Category").astype(str).str.strip().value_counts()
-        if "user_category_clean" in df.columns
-        else pd.Series(dtype="int64")
-    )
-
-    founder_count = int(category_counts_series.get("Founder", 0))
-    investor_count = int(category_counts_series.get("Investor", 0))
-    student_count = int(category_counts_series.get("Student", 0))
-    professional_count = int(category_counts_series.get("Professional", 0))
-
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        metric_card("Total Registrations", total_records)
-    with c2:
-        metric_card("Unique Users", unique_users)
-    with c3:
-        metric_card("Founders", founder_count)
-
-    c4, c5, c6 = st.columns(3)
-    with c4:
-        metric_card("Investors", investor_count)
-    with c5:
-        metric_card("Students", student_count)
-    with c6:
-        metric_card("Professionals", professional_count)
-
-    # Email domain analytics requested in CEO review.
-    st.markdown('<div class="section-title">📧 Email Domain Overview</div>', unsafe_allow_html=True)
-    domain_counts = (
-        df["email_domain_group"].fillna("Unknown").value_counts()
-        if "email_domain_group" in df.columns
-        else pd.Series(dtype="int64")
-    )
-    d1, d2, d3 = st.columns(3)
-    with d1:
-        metric_card("Gmail", int(domain_counts.get("Gmail", 0)))
-    with d2:
-        metric_card("Other Domains", int(domain_counts.get("Other Domain", 0)))
-    with d3:
-        metric_card("No Email", int(domain_counts.get("No Email", 0)))
-
-    # Actual cleaned categories
-    st.markdown('<div class="section-title">📊 Actual User Categories</div>', unsafe_allow_html=True)
-    category_counts = (
-        df["user_category_clean"]
-        .fillna("No Category")
-        .astype(str)
-        .str.strip()
-        .value_counts()
-        .rename_axis("Category")
-        .reset_index(name="Records")
-    )
-    st.dataframe(category_counts, use_container_width=True, hide_index=True)
-
-    # Filter summary
-    st.markdown('<div class="section-title">🔎 Filtered Results</div>', unsafe_allow_html=True)
-    matching_records = len(filtered_df)
-    matching_unique = unique_email_count(filtered_df)
-
-    r1, r2 = st.columns(2)
-    with r1:
-        metric_card("Matching Records", matching_records)
-    with r2:
-        metric_card("Matching Unique Users", matching_unique)
-
-    # Visible active-filter summary helps verify CEO filter behavior.
-    active_filters = []
-    if date_mode != "All Dates":
-        active_filters.append(f"Date: {date_mode}")
-    for label, value in [
-        ("Category", selected_category),
-        ("Event", selected_event),
-        ("Event Type", selected_event_type),
-        ("Event Mode", selected_event_mode),
-        ("City", selected_city),
-        ("Designation", selected_designation),
-        ("Are You", selected_are_you),
-        ("Email Domain", selected_domain_group),
-        ("Existing Valid Email", selected_valid_email),
-        ("External Verification", selected_verification),
-    ]:
-        if value != "All":
-            active_filters.append(f"{label}: {value}")
-    if search_text.strip():
-        active_filters.append(f"Search: {search_text.strip()}")
-
-    if active_filters:
-        st.info("Active filters → " + " | ".join(active_filters))
-
-    # Pagination
-    rows_per_page = st.selectbox(
-        "Rows per page",
-        [25, 50, 100, 250],
-        index=1,
-        key="luma_rows",
-    )
-    total_pages = max(1, math.ceil(matching_records / rows_per_page))
-    page = st.number_input(
-        f"Page (1 - {total_pages})",
-        min_value=1,
-        max_value=total_pages,
-        value=1,
-        step=1,
-        key="luma_page",
-    )
-
-    start = (page - 1) * rows_per_page
-    end = start + rows_per_page
-    page_df = filtered_df.iloc[start:end].copy()
-
-    preferred_display_columns = [
-        "first_name",
-        "last_name",
-        "email",
-        "phone",
-        "linkedin",
-        "city_clean",
-        "designation_clean_filter",
-        "company_name",
-        "luma_event_name_clean",
-        "luma_event_type_clean",
-        "event_mode_clean",
-        "event_date_clean",
-        "user_category_clean",
-        "are_you_clean",
-        "email_domain",
-        "email_domain_group",
-        "valid_email_clean",
-        "email_verification_status",
-        "email_verified_at",
-        "source",
-        "source_sheet",
-    ]
-    preferred_display_columns = [c for c in preferred_display_columns if c in page_df.columns]
-
-    st.caption(f"Page {page} of {total_pages} • Showing {len(page_df):,} rows")
-    st.dataframe(
-        page_df[preferred_display_columns],
-        use_container_width=True,
-        hide_index=True,
-    )
-
-    # Export
-    st.markdown('<div class="section-title">📥 Export Luma Data</div>', unsafe_allow_html=True)
-    excel_data = make_excel(filtered_df.drop(columns=["imported_at_dt"], errors="ignore"), "Luma Data")
-    st.download_button(
-        "⬇️ Download Filtered Excel",
-        data=excel_data,
-        file_name="hidevs_luma_filtered.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        key="download_luma",
-    )
-
-
-# ============================================================
-# MASTER DATA
-# ============================================================
-
-else:
-
-    st.markdown(
-        '<div class="section-title">👥 Master Data Dashboard</div>',
-        unsafe_allow_html=True,
-    )
-
-    try:
-        master_df = load_table("Data")
-    except Exception as e:
-        st.error("Could not load Master Data from Supabase.")
-        st.exception(e)
-        st.stop()
-
-    if master_df.empty:
-        st.warning('The "Data" table returned no records.')
-        st.stop()
-
-    st.success(f"Successfully loaded {len(master_df):,} master records from Data.")
-
-    for col in master_df.columns:
-        if master_df[col].dtype == "object":
-            master_df[col] = master_df[col].fillna("").astype(str).str.strip()
-
-    if "master_category" in master_df.columns:
-        master_df["master_category"] = (
-            master_df["master_category"]
-            .fillna("other/Blank")
-            .astype(str)
-            .str.strip()
-        )
-        master_df.loc[master_df["master_category"] == "", "master_category"] = "other/Blank"
-
-    st.sidebar.markdown("---")
-    st.sidebar.markdown("### 🔎 Master Data Filters")
-
-    if "master_category" in master_df.columns:
-        master_category_options = ["All"] + safe_unique(master_df, "master_category")
-        selected_master_category = st.sidebar.selectbox(
-            "Master Category",
-            master_category_options,
-            key="master_category_filter",
-        )
-    else:
-        selected_master_category = "All"
-
-    first_name_options = ["All"] + safe_unique(master_df, "First_name")
-    selected_first_name = st.sidebar.selectbox(
-        "First Name",
-        first_name_options,
-        key="master_first_name",
-    )
-
-    city_options = ["All"] + safe_unique(master_df, "city")
-    selected_master_city = st.sidebar.selectbox(
-        "City",
-        city_options,
-        key="master_city",
-    )
-
-    designation_options = ["All"] + safe_unique(master_df, "designation")
-    selected_master_designation = st.sidebar.selectbox(
-        "Designation",
-        designation_options,
-        key="master_designation",
-    )
-
-    company_column = None
-    if "company_name" in master_df.columns:
-        company_column = "company_name"
-    elif "organization_name" in master_df.columns:
-        company_column = "organization_name"
-
-    if company_column:
-        company_options = ["All"] + safe_unique(master_df, company_column)
-        selected_company = st.sidebar.selectbox(
-            "Company",
-            company_options,
-            key="master_company",
-        )
-    else:
-        selected_company = "All"
-
-    source_options = ["All"] + safe_unique(master_df, "source")
-    selected_source = st.sidebar.selectbox(
-        "Source",
-        source_options,
-        key="master_source",
-    )
-
-    source_tab_options = ["All"] + safe_unique(master_df, "source_tab")
-    selected_source_tab = st.sidebar.selectbox(
-        "Source Tab",
-        source_tab_options,
-        key="master_source_tab",
-    )
-
-    designation_clean_options = ["All"] + safe_unique(master_df, "designation_clean")
-    selected_designation_clean = st.sidebar.selectbox(
-        "Designation Clean",
-        designation_clean_options,
-        key="master_designation_clean",
-    )
-
-    designation_normalized_options = ["All"] + safe_unique(master_df, "designation_normalized")
-    selected_designation_normalized = st.sidebar.selectbox(
-        "Designation Normalized",
-        designation_normalized_options,
-        key="master_designation_normalized",
-    )
-
-    leadership_role_options = ["All"] + safe_unique(master_df, "leadership_role")
-    selected_leadership_role = st.sidebar.selectbox(
-        "Leadership Role",
-        leadership_role_options,
-        key="master_leadership_role",
-    )
-
-    valid_email_options = ["All"] + safe_unique(master_df, "valid_email")
-    selected_master_valid_email = st.sidebar.selectbox(
-        "Valid Email",
-        valid_email_options,
-        key="master_valid_email",
-    )
-
-    master_search = st.sidebar.text_input(
-        "Search Master Data",
-        placeholder="Search name, email, company or LinkedIn",
-        key="master_search",
-    )
-
-    filtered_master = master_df.copy()
-
-    if selected_master_category != "All" and "master_category" in filtered_master.columns:
-        filtered_master = filtered_master[filtered_master["master_category"] == selected_master_category]
-
-    if selected_first_name != "All":
-        filtered_master = filtered_master[filtered_master["First_name"] == selected_first_name]
-
-    if selected_master_city != "All":
-        filtered_master = filtered_master[filtered_master["city"] == selected_master_city]
-
-    if selected_master_designation != "All":
-        filtered_master = filtered_master[filtered_master["designation"] == selected_master_designation]
-
-    if selected_company != "All" and company_column:
-        filtered_master = filtered_master[filtered_master[company_column] == selected_company]
-
-    if selected_source != "All":
-        filtered_master = filtered_master[filtered_master["source"] == selected_source]
-
-    if selected_source_tab != "All":
-        filtered_master = filtered_master[filtered_master["source_tab"] == selected_source_tab]
-
-    if selected_designation_clean != "All":
-        filtered_master = filtered_master[filtered_master["designation_clean"] == selected_designation_clean]
-
-    if selected_designation_normalized != "All":
-        filtered_master = filtered_master[filtered_master["designation_normalized"] == selected_designation_normalized]
-
-    if selected_leadership_role != "All":
-        filtered_master = filtered_master[filtered_master["leadership_role"] == selected_leadership_role]
-
-    if selected_master_valid_email != "All":
-        filtered_master = filtered_master[filtered_master["valid_email"] == selected_master_valid_email]
-
-    if master_search.strip():
-        search = master_search.strip().lower()
-        search_columns = [
-            "First_name",
-            "last_name",
-            "email",
-            "linkedin",
-            "company_name",
-            "organization_name",
-            "designation",
-            "name_field",
-        ]
-        mask = pd.Series(False, index=filtered_master.index)
-        for col in search_columns:
-            if col in filtered_master.columns:
-                mask |= (
-                    filtered_master[col]
-                    .astype(str)
-                    .str.lower()
-                    .str.contains(search, regex=False, na=False)
-                )
-        filtered_master = filtered_master[mask]
-
-    st.markdown('<div class="section-title">📈 Master Data Overview</div>', unsafe_allow_html=True)
-
-    total_master = len(master_df)
-    if "email" in master_df.columns:
-        unique_master = (
-            master_df["email"]
-            .replace("", pd.NA)
-            .dropna()
-            .nunique()
-        )
-    else:
-        unique_master = total_master
-
-    category_counts = pd.DataFrame(columns=["master_category", "record_count"])
-    if "master_category" in master_df.columns:
-        category_counts = (
-            master_df
-            .groupby("master_category", dropna=False)
-            .size()
-            .reset_index(name="record_count")
-            .sort_values("record_count", ascending=False)
-        )
-
-    category_lookup = dict(zip(category_counts["master_category"], category_counts["record_count"]))
-
-    founder_count = category_lookup.get("Founder", 0)
-    senior_count = category_lookup.get("Senior Leaderships/C-Suite", 0)
-    director_count = category_lookup.get("Director/VP/senior Proffessionals", 0)
-    professional_count = category_lookup.get("Professionals", 0)
-    student_count = category_lookup.get("Students/Intern", 0)
-    investor_count = category_lookup.get("Investors", 0)
-
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        metric_card("Total Master Records", total_master)
-    with c2:
-        metric_card("Unique Users", unique_master)
-    with c3:
-        metric_card("Founder", founder_count)
-
-    c4, c5, c6 = st.columns(3)
-    with c4:
-        metric_card("Senior Leadership / C-Suite", senior_count)
-    with c5:
-        metric_card("Director / VP / Senior Professional", director_count)
-    with c6:
-        metric_card("Professionals", professional_count)
-
-    c7, c8 = st.columns(2)
-    with c7:
-        metric_card("Students / Intern", student_count)
-    with c8:
-        metric_card("Investors", investor_count)
-
-    st.markdown('<div class="section-title">📊 Master Data Categories</div>', unsafe_allow_html=True)
-    if not category_counts.empty:
-        st.dataframe(category_counts, use_container_width=True, hide_index=True)
-    else:
-        st.info("master_category column is not available.")
-
-    st.markdown('<div class="section-title">🔎 Filtered Master Data</div>', unsafe_allow_html=True)
-
-    matching_master = len(filtered_master)
-    if "email" in filtered_master.columns:
-        matching_unique_master = (
-            filtered_master["email"]
-            .replace("", pd.NA)
-            .dropna()
-            .nunique()
-        )
-    else:
-        matching_unique_master = matching_master
-
-    c1, c2 = st.columns(2)
-    with c1:
-        metric_card("Matching Records", matching_master)
-    with c2:
-        metric_card("Matching Unique Users", matching_unique_master)
-
-    rows_per_page = st.selectbox(
-        "Rows per page",
-        [25, 50, 100, 250],
-        index=1,
-        key="master_rows",
-    )
-    total_pages = max(1, math.ceil(matching_master / rows_per_page))
-    page = st.number_input(
-        f"Page (1 - {total_pages})",
-        min_value=1,
-        max_value=total_pages,
-        value=1,
-        step=1,
-        key="master_page",
-    )
-
-    start = (page - 1) * rows_per_page
-    end = start + rows_per_page
-    master_page_df = filtered_master.iloc[start:end]
-
-    st.caption(f"Page {page} of {total_pages} • Showing {len(master_page_df):,} rows")
-    st.dataframe(master_page_df, use_container_width=True, hide_index=True)
-
-    st.markdown('<div class="section-title">📥 Export Master Data</div>', unsafe_allow_html=True)
-    master_excel = make_excel(filtered_master, "Master Data")
-    st.download_button(
-        "⬇️ Download Filtered Master Excel",
-        data=master_excel,
-        file_name="hidevs_master_filtered.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        key="download_master",
-    )
+    for suffix in state_suffixes:
+        if key.endswith(suffix) and len(key) > len(suffix):
+            text = text[: len(text) - len(suffix)].strip(" ,.-")
+            key = text.lower()
+            break
+
+    if key in MASTER_CITY_ALIASES:
+        return MASTER_CITY_ALIASES[key]
+
+    if key in MASTER_CITY_NOT_CITY:
+        return "Not Specified"
+
+    # Reject strings that still look like addresses / descriptions.
+    if re.search(r"\d", text):
+        return "Not Specified"
+    if len(text) > 42:
+        return "Not Specified"
+    if len(text.split()) > 5:
+        return "Not Specified"
+
+    # Normalize all-uppercase/lowercase duplicates.
+    # Keep normal title punctuation such as "Gometz-la-Ville".
+    cleaned = " ".join(word.capitalize() for word in text.split())
+
+    # Restore common canonical forms.
+    canonical_case = {
+        "Bengaluru": "Bengaluru",
+        "Bhubaneswar": "Bhubaneswar",
+        "Gandhinagar": "Gandhinagar",
+        "New York": "New York",
+        "San Francisco": "San Francisco",
+        "San Jose": "San Jose",
+        "Los Angeles": "Los Angeles",
+        "Abu Dhabi": "Abu Dhabi",
+        "Ho Chi Minh City": "Ho Chi Minh City",
+        "Kuala Lumpur": "Kuala Lumpur",
+        "Hong Kong": "Hong Kong",
+    }
+    return canonical_case.get(cleaned, cleaned)
+
+
+def build_master_city_filter(series):
+    """
+    STRICT dashboard city cleaner.
+
+    Goal: show only useful, canonical CITY names in the dashboard.
+    - Normalizes common variants such as Bangalore/Bengaluru.
+    - Converts a small number of obvious locality/region variants.
+    - Rejects countries, states, industries, mixed-city strings, and noise.
+    - Uses a curated allow-list so the dropdown stays compact.
+    """
+
+    # Canonical aliases observed in the uploaded Luma + Master workbooks.
+    aliases = {
+        # India
+        "bangalore": "Bengaluru",
+        "bangaluru": "Bengaluru",
+        "bengaluru": "Bengaluru",
+        "banglore": "Bengaluru",
+        "bangalore urban": "Bengaluru",
+        "bengaluru urban": "Bengaluru",
+        "bangalore karnataka": "Bengaluru",
+        "bengaluru karnataka": "Bengaluru",
+        "devarbisanahalli": "Bengaluru",
+        "panathur": "Bengaluru",
+        "k r puram": "Bengaluru",
+        "kr puram": "Bengaluru",
+        "mahadevapura": "Bengaluru",
+        "sarvajna nagar": "Bengaluru",
+        "gurgaon": "Gurugram",
+        "gurugram": "Gurugram",
+        "new delhi": "Delhi",
+        "delhi": "Delhi",
+        "delhi india": "Delhi",
+        "pune maharashtra india": "Pune",
+        "pune maharashtra": "Pune",
+        "hyderabad telangana india": "Hyderabad",
+        "hyderabad telangana": "Hyderabad",
+        "gandhinagar gujarat": "Gandhinagar",
+        "ernakulam": "Kochi",
+        # Global common variants
+        "new york city": "New York",
+        "ny": "New York",
+        "san francisco california": "San Francisco",
+        "st louis": "St. Louis",
+        "st louis missouri": "St. Louis",
+        "houstun": "Houston",
+    }
+
+    # Deliberately compact: only main/useful cities retained.
+    allowed_cities = {
+        # India
+        "Bengaluru", "Mumbai", "Pune", "Gurugram", "Delhi",
+        "Chennai", "Hyderabad", "Noida", "Ahmedabad", "Kolkata", "Jaipur",
+        "Thane", "Vadodara", "Indore", "Navi Mumbai", "Kochi", "Chandigarh",
+        "Ludhiana", "Coimbatore", "Surat", "Nagpur", "Mohali", "Nashik",
+        "Bhubaneswar", "Faridabad", "Lucknow", "Ghaziabad", "Gandhinagar",
+        "Rajkot", "Aurangabad", "Raipur",
+        # Major international cities actually represented in the uploaded data
+        "Singapore", "New York", "San Francisco", "Chicago", "Dubai", "Boston",
+        "Seattle", "Houston", "Atlanta", "Austin", "Los Angeles", "San Jose",
+        "Dallas", "Jakarta", "Washington", "San Diego", "Riyadh", "London",
+        "Bangkok", "Denver", "Philadelphia", "Vienna", "Miami", "Baltimore",
+        "Cincinnati", "Minneapolis", "Columbus", "Portland", "Abu Dhabi",
+        "Charlotte", "Phoenix", "Mountain View", "Redwood City", "Irvine",
+        "Madison", "Princeton", "Kuala Lumpur", "Palo Alto", "Salt Lake City",
+        "Montreal", "Istanbul", "Sunnyvale", "Nashville", "Orlando", "Toronto",
+        "Dublin", "Tokyo", "Munich", "Brussels", "Amsterdam", "Melbourne",
+        "Milan", "Paris", "St. Louis",
+    }
+
+    # Direct canonical lookup ignoring case.
+    canonical_lookup = {c.lower(): c for c in allowed_cities}
+
+    def normalize_key(value):
+        if pd.isna(value):
+            return ""
+        s = unicodedata.normalize("NFKD", str(value))
+        s = "".join(ch for ch in s if not unicodedata.combining(ch))
+        s = s.strip().lower()
+        s = re.sub(r"[|;/]+", " ", s)
+        s = re.sub(r"[^a-z0-9 ]+", " ", s)
+        s = re.sub(r"\s+", " ", s).strip()
+        return s
+
+    def clean_one(value):
+        key = normalize_key(value)
+        if not key:
+            return "Not Specified"
+
+        # Explicitly reject mixed-city / non-city values instead of guessing.
+        if re.search(r"\b(and|or)\b", key):
+            return "Not Specified"
+
+        if key in aliases:
+            result = aliases[key]
+            return result if result in allowed_cities else "Not Specified"
+
+        if key in canonical_lookup:
+            return canonical_lookup[key]
+
+        # Handle safe "City, State, Country" style values only when the FIRST
+        # component itself is one of our curated cities.
+        raw = str(value).strip()
+        first = re.split(r"[,|;/]", raw)[0].strip()
+        first_key = normalize_key(first)
+        if first_key in aliases:
+            result = aliases[first_key]
+            return result if result in allowed_cities else "Not Specified"
+        if first_key in canonical_lookup:
+            return canonical_lookup[first_key]
+
+        return "Not Specified"
+
+    return series.apply(clean_one)
+
+
+MASTER_DESIGNATION_GARBAGE = {
+    "", "nan", "none", "null", "other", "others", "n/a", "na",
+    "study", "bachelors", "bacherlors", "engineering",
+    "information technology", "computer science and technology",
+    "exploring ai tools", "building production apps",
+    "prototyping side projects", "learn mcp", "research intent",
+}
+
+
+MASTER_DESIGNATION_COMPANIES = {
+    "accenture", "tcs", "infosys", "wipro", "cognizant", "hcl",
+    "ibm", "google", "amazon", "microsoft", "oracle", "deloitte",
+    "capgemini", "tech mahindra", "ltimindtree",
+}
+
+
+def canonical_master_designation(value):
+    """Clean a Master designation while preserving legitimate specialist roles."""
+    if value is None or pd.isna(value):
+        return "Not Specified"
+
+    text = unicodedata.normalize("NFKC", str(value)).strip()
+    text = re.sub(r"\s+", " ", text)
+
+    if not text:
+        return "Not Specified"
+
+    key = text.lower().strip(" .,-_/")
+
+    if key in MASTER_DESIGNATION_GARBAGE or key in MASTER_DESIGNATION_COMPANIES:
+        return "Not Specified"
+
+    # Years / batches / numeric junk.
+    if re.fullmatch(r"\d+", key) or re.fullmatch(r"20\d{2}", key):
+        return "Not Specified"
+    if re.match(r"^20\d{2}\s*[-/]", key):
+        return "Not Specified"
+
+    # Student-year normalization.
+    if re.search(r"\b(1|1st|first)\s*(year|yr)\b", key):
+        return "1st Year"
+    if re.search(r"\b(2|2nd|2rd|second)\s*(year|yr)\b", key):
+        return "2nd Year"
+    if re.search(r"\b(3|3rd|third)\s*(year|yr)\b", key):
+        return "3rd Year"
+    if re.search(r"\b(4|4th|4rth|fourth)\s*(year|yr)\b", key) or "final year" in key:
+        return "4th Year"
+
+    # Very common executive / founder variants.
+    exact_map = {
+        "chief executive officer": "CEO",
+        "ceo": "CEO",
+        "ceo.": "CEO",
+        "chief technology officer": "CTO",
+        "cto": "CTO",
+        "chief information officer": "CIO",
+        "cio": "CIO",
+        "chief operating officer": "COO",
+        "coo": "COO",
+        "chief financial officer": "CFO",
+        "cfo": "CFO",
+        "chief information security officer": "CISO",
+        "ciso": "CISO",
+        "co founder": "Co-Founder",
+        "co-founder": "Co-Founder",
+        "cofounder": "Co-Founder",
+        "head it": "Head of IT",
+        "head - it": "Head of IT",
+        "head of it": "Head of IT",
+        "head of information technology": "Head of IT",
+        "it head": "Head of IT",
+        "it director": "IT Director",
+        "director of information technology": "IT Director",
+        "director it": "IT Director",
+        "sde": "Software Engineer",
+        "sde1": "Software Engineer",
+        "sre": "Site Reliability Engineer",
+        "devops": "DevOps Engineer",
+        "ui ux designer": "UI/UX Designer",
+        "ui/ux designer": "UI/UX Designer",
+    }
+    if key in exact_map:
+        return exact_map[key]
+
+    # Compound founder/executive titles.
+    if ("founder" in key or "co-founder" in key or "co founder" in key) and "ceo" in key:
+        return "Founder & CEO"
+    if ("founder" in key or "co-founder" in key or "co founder" in key) and "cto" in key:
+        return "Founder & CTO"
+
+    # Preserve real specialist designations; normalize whitespace/casing only.
+    # Avoid title-casing acronyms aggressively when the source already looks clean.
+    if text.isupper() and len(text) <= 6:
+        return text
+
+    return text
+
+
+def build_master_designation_filter(master_df):
+    """
+    Convert thousands of raw designation strings into a compact set of useful
+    main roles. Random company names, sentences, volunteer labels and noise are
+    intentionally excluded as Not Specified.
+    """
+
+    if "Designation" not in master_df.columns:
+        return pd.Series("Not Specified", index=master_df.index)
+
+    def norm(value):
+        if pd.isna(value):
+            return ""
+        s = unicodedata.normalize("NFKD", str(value))
+        s = "".join(ch for ch in s if not unicodedata.combining(ch))
+        s = s.lower().strip()
+        s = re.sub(r"[^a-z0-9+#/& -]+", " ", s)
+        s = re.sub(r"\s+", " ", s).strip()
+        return s
+
+    def classify(value):
+        s = norm(value)
+        if not s or s in {"none", "nan", "na", "n/a", "other", "not specified"}:
+            return "Not Specified"
+
+        # Student years — preserve the four CEO-requested canonical values.
+        if re.search(r"\b(1|1st|first)\s*(year|yr)\b", s):
+            return "1st Year"
+        if re.search(r"\b(2|2nd|2rd|second)\s*(year|yr)\b", s):
+            return "2nd Year"
+        if re.search(r"\b(3|3rd|third)\s*(year|yr)\b", s):
+            return "3rd Year"
+        if re.search(r"\b(4|4th|4rth|fourth)\s*(year|yr)\b", s) or "final year" in s:
+            return "4th Year"
+
+        # Generic student / intern.
+        if re.search(r"\b(student|intern|internship|trainee|fresher|undergraduate|graduate student)\b", s):
+            return "Student / Intern"
+
+        # Founders / ownership.
+        if re.search(r"\b(co[- ]?founder|founder|entrepreneur)\b", s):
+            return "Founder / Co-Founder"
+
+        # C-suite — keep the main executive roles distinct.
+        if re.search(r"\b(chief executive officer|group ceo|ceo)\b", s):
+            return "CEO"
+        if re.search(r"\b(chief technology officer|chief technical officer|group cto|field cto|cto)\b", s):
+            return "CTO"
+        if re.search(r"\b(chief information officer|group cio|cio)\b", s):
+            return "CIO"
+        if re.search(r"\b(chief operating officer|chief operations officer|coo)\b", s):
+            return "COO"
+        if re.search(r"\b(chief financial officer|cfo)\b", s):
+            return "CFO"
+        if re.search(r"\b(chief information security officer|ciso)\b", s):
+            return "CISO"
+        if re.search(r"\b(chief product officer|chief product & technology officer|chief product and technology officer)\b", s):
+            return "Chief Product Officer"
+        if re.search(r"\b(chief people officer|chief human resources officer|chro)\b", s):
+            return "Chief People / HR Officer"
+        if re.search(r"\bchief (digital|innovation|risk|business|data|marketing|strategy|growth) officer\b", s):
+            return "Other C-Suite"
+
+        # Senior leadership.
+        if re.search(r"\b(managing director|joint managing director|\\bmd\\b)\b", s):
+            return "Managing Director"
+        if re.search(r"\b(executive vice president|senior vice president|associate vice president|assistant vice president|vice president|vp|svp|avp)\b", s):
+            return "Vice President"
+        if re.search(r"\b(chairman|chairperson|president)\b", s):
+            return "President / Chairman"
+        if re.search(r"\b(director|executive director)\b", s):
+            return "Director"
+        if re.search(r"\b(head of|global head|regional head|department head|business head|technology head|engineering head|product head|sales head|marketing head|hr head|people head)\b", s):
+            return "Head"
+
+        # Investors / partners.
+        if re.search(r"\b(investor|venture capitalist|angel investor)\b", s):
+            return "Investor"
+        if re.search(r"\b(managing partner|general partner|venture partner|partner)\b", s):
+            return "Partner"
+
+        # Core technology / product / data roles.
+        if re.search(r"\b(ai engineer|artificial intelligence engineer|machine learning engineer|ml engineer|genai engineer|generative ai engineer|prompt engineer)\b", s):
+            return "AI / ML Engineer"
+        if re.search(r"\b(data scientist|data science)\b", s):
+            return "Data Scientist"
+        if re.search(r"\b(data analyst|analytics analyst)\b", s):
+            return "Data Analyst"
+        if re.search(r"\b(software engineer|software developer|sde|full stack|fullstack|frontend|front end|backend|back end|application developer|web developer)\b", s):
+            return "Software Engineer / Developer"
+        if re.search(r"\b(solution architect|solutions architect|software architect|enterprise architect|cloud architect|technical architect|architect)\b", s):
+            return "Architect"
+        if re.search(r"\b(engineering manager|manager engineering|engineering lead|tech lead|technical lead|team lead)\b", s):
+            return "Engineering / Tech Lead"
+        if re.search(r"\b(it manager|information technology manager|manager it|chief manager it)\b", s):
+            return "IT Manager"
+        if re.search(r"\b(product manager|product management|product owner)\b", s):
+            return "Product Manager"
+        if re.search(r"\b(project manager|program manager|programme manager|delivery manager)\b", s):
+            return "Project / Program Manager"
+        if re.search(r"\b(business analyst)\b", s):
+            return "Business Analyst"
+        if re.search(r"\b(consultant|consulting|advisor|adviser)\b", s):
+            return "Consultant / Advisor"
+        if re.search(r"\b(human resources|\\bhr\\b|talent acquisition|recruiter|people operations)\b", s):
+            return "HR / People"
+        if re.search(r"\b(sales|business development|account executive|revenue)\b", s):
+            return "Sales / Business Development"
+        if re.search(r"\b(marketing|growth|brand|content|social media)\b", s):
+            return "Marketing / Growth"
+        if re.search(r"\b(manager|senior manager|general manager)\b", s):
+            return "Manager"
+
+        # Generic professional labels only if clearly a role, not arbitrary text.
+        if re.fullmatch(r"(tech|technology|it) professional", s):
+            return "Technology Professional"
+
+        return "Not Specified"
+
+    return master_df["Designation"].apply(classify)
 
 
 # ============================================================
-# FOOTER
+# UNIFIED LUMA + MASTER PEOPLE DASHBOARD
 # ============================================================
 
 st.markdown(
-    """
-    <div class="footer">
-        HiDevs Data Explorer • Supabase-powered analytics dashboard
-    </div>
-    """,
+    '<div class="section-title">👥 Unified People Dashboard</div>',
+    unsafe_allow_html=True,
+)
+
+refresh_col, info_col = st.columns([1, 5])
+with refresh_col:
+    if st.button("🔄 Refresh Data", use_container_width=True):
+        st.cache_data.clear()
+        st.rerun()
+
+try:
+    with st.spinner("Loading unified people data from Supabase..."):
+        people_df = load_table("unified_people_dashboard", order_column="person_key")
+        event_df = load_table("person_event", order_column="person_event_id")
+except Exception as e:
+    st.error("Could not load unified dashboard data from Supabase.")
+    st.exception(e)
+    st.stop()
+
+if people_df.empty:
+    st.warning('The "unified_people_dashboard" table returned no records.')
+    st.stop()
+
+for frame in [people_df, event_df]:
+    for col in frame.columns:
+        if frame[col].dtype == "object":
+            frame[col] = frame[col].apply(
+                lambda x: x.strip() if isinstance(x, str) else x
+            )
+
+if "event_date" in event_df.columns:
+    event_df["event_date"] = pd.to_datetime(
+        event_df["event_date"], errors="coerce"
+    ).dt.date
+
+# Strict canonical dashboard values derived from the uploaded Luma + Master data.
+people_df["_city_filter"] = (
+    build_master_city_filter(people_df["City"])
+    if "City" in people_df.columns
+    else "Not Specified"
+)
+people_df["_designation_filter"] = build_master_designation_filter(people_df)
+
+# For CEO-facing display/export, show the cleaned values rather than noisy originals.
+people_df["City Clean"] = people_df["_city_filter"]
+people_df["Designation Clean"] = people_df["_designation_filter"]
+
+with info_col:
+    unique_events = (
+        event_df["luma_event_name"].nunique()
+        if "luma_event_name" in event_df.columns else 0
+    )
+    st.markdown(
+        f"""
+        <div class="info-card">
+            <b>Unified Luma + Master</b> &nbsp;•&nbsp;
+            <b>{len(people_df):,}</b> unique people &nbsp;•&nbsp;
+            <b>{unique_events:,}</b> Luma events
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+CATEGORY_TO_FLAG = {
+    "Founder": "is_founder",
+    "Investor": "is_investor",
+    "Student / Intern": "is_student_intern",
+    "Professional": "is_professional",
+    "Senior Leadership / C-Suite": "is_senior_leadership",
+    "Director / VP / Senior Professional": "is_director_vp",
+    "Other / Blank": "is_other_blank",
+}
+
+city_options = clean_values(
+    people_df.loc[people_df["_city_filter"].ne("Not Specified"), "_city_filter"]
+)
+designation_options = clean_values(
+    people_df.loc[
+        people_df["_designation_filter"].ne("Not Specified"),
+        "_designation_filter",
+    ]
+)
+
+# ============================================================
+# HORIZONTAL FILTERS
+# - Data Source filter removed
+# - Designation filter removed
+# - Custom Date Range appears immediately when selected
+# - Actual filtering still happens only after Apply Filters
+# ============================================================
+
+st.markdown(
+    '<div class="section-title">🔎 Filters</div>',
+    unsafe_allow_html=True,
+)
+st.caption("Choose the filters you need, then click Apply Filters.")
+
+# Event Date is intentionally OUTSIDE the form.
+# Changing it may rerun the UI, but it does NOT apply filters.
+date_col1, date_col2 = st.columns([1.2, 2.8])
+
+with date_col1:
+    f_date_mode = st.selectbox(
+        "Event Date",
+        [
+            "All Dates",
+            "Today",
+            "Last 7 Days",
+            "Last 30 Days",
+            "This Month",
+            "Custom Date Range",
+        ],
+        key="pending_date_mode",
+    )
+
+event_dates = (
+    event_df["event_date"].dropna()
+    if "event_date" in event_df.columns
+    else pd.Series(dtype="object")
+)
+min_d = event_dates.min() if not event_dates.empty else date.today()
+max_d = event_dates.max() if not event_dates.empty else date.today()
+
+with date_col2:
+    if f_date_mode == "Custom Date Range":
+        f_custom_dates = st.date_input(
+            "Custom Date Range",
+            value=(min_d, max_d),
+            min_value=min_d,
+            max_value=max_d,
+            key="pending_custom_dates",
+        )
+    else:
+        f_custom_dates = None
+
+HIDDEN_EVENT_TYPES = {
+    "giveaway",
+    "orientation",
+    "hiring mela",
+    "not specified",
+    "not-specified",
+    "not_specified",
+}
+
+def clean_event_type_options(df):
+    values = safe_unique(df, "luma_event_type")
+    return [
+        value for value in values
+        if str(value).strip().lower() not in HIDDEN_EVENT_TYPES
+        and str(value).strip().lower() not in {"", "nan", "none", "null"}
+    ]
+
+event_type_options = clean_event_type_options(event_df)
+
+with st.form("unified_filter_form", clear_on_submit=False):
+
+    r1c1, r1c2, r1c3 = st.columns(3)
+
+    with r1c1:
+        f_category = st.selectbox(
+            "Category",
+            ["All"] + list(CATEGORY_TO_FLAG.keys()),
+        )
+
+    with r1c2:
+        f_event = st.selectbox(
+            "Event",
+            ["All"] + safe_unique(event_df, "luma_event_name"),
+        )
+
+    with r1c3:
+        f_event_type = st.selectbox(
+            "Event Type",
+            ["All"] + event_type_options,
+        )
+
+    r2c1, r2c2, r2c3 = st.columns(3)
+
+    with r2c1:
+        f_event_mode = st.selectbox(
+            "Event Mode",
+            ["All"] + safe_unique(event_df, "event_mode"),
+        )
+
+    with r2c2:
+        f_city = st.selectbox(
+            "City",
+            ["All"] + city_options,
+        )
+
+    with r2c3:
+        f_domain = st.selectbox(
+            "Email Domain",
+            ["All"] + safe_unique(people_df, "email_domain_group"),
+        )
+
+    f_search = st.text_input(
+        "Search",
+        placeholder="Name, email, company, LinkedIn...",
+    )
+
+    apply_filters = st.form_submit_button(
+        "🔍 Apply Filters",
+        type="primary",
+        use_container_width=True,
+    )
+
+if "applied_filters" not in st.session_state:
+    st.session_state.applied_filters = {
+        "category": "All",
+        "event": "All",
+        "event_type": "All",
+        "event_mode": "All",
+        "city": "All",
+        "domain": "All",
+        "date_mode": "All Dates",
+        "custom_dates": None,
+        "search": "",
+    }
+
+if apply_filters:
+    st.session_state.applied_filters = {
+        "category": f_category,
+        "event": f_event,
+        "event_type": f_event_type,
+        "event_mode": f_event_mode,
+        "city": f_city,
+        "domain": f_domain,
+        "date_mode": f_date_mode,
+        "custom_dates": f_custom_dates,
+        "search": f_search.strip(),
+    }
+
+F = st.session_state.applied_filters
+filtered_people = people_df.copy()
+
+# People-level filters.
+if F["category"] != "All":
+    flag = CATEGORY_TO_FLAG[F["category"]]
+    if flag in filtered_people.columns:
+        filtered_people = filtered_people[
+            filtered_people[flag].fillna(False).astype(bool)
+        ]
+
+if F["city"] != "All":
+    filtered_people = filtered_people[
+        filtered_people["_city_filter"] == F["city"]
+    ]
+
+if F["domain"] != "All":
+    filtered_people = apply_exact_filter(
+        filtered_people,
+        "email_domain_group",
+        F["domain"],
+    )
+
+# Event/date filters use person_event.
+date_start = date_end = None
+
+if F["date_mode"] == "Today":
+    date_start = date_end = date.today()
+elif F["date_mode"] == "Last 7 Days":
+    date_end = date.today()
+    date_start = date_end - timedelta(days=6)
+elif F["date_mode"] == "Last 30 Days":
+    date_end = date.today()
+    date_start = date_end - timedelta(days=29)
+elif F["date_mode"] == "This Month":
+    date_end = date.today()
+    date_start = date_end.replace(day=1)
+elif F["date_mode"] == "Custom Date Range" and F["custom_dates"]:
+    rng = F["custom_dates"]
+    if isinstance(rng, (tuple, list)) and len(rng) == 2:
+        date_start, date_end = rng
+
+event_filter_active = (
+    F["event"] != "All"
+    or F["event_type"] != "All"
+    or F["event_mode"] != "All"
+    or F["date_mode"] != "All Dates"
+)
+
+if event_filter_active:
+    event_matches = event_df.copy()
+
+    if (
+        date_start is not None
+        and date_end is not None
+        and "event_date" in event_matches.columns
+    ):
+        event_matches = event_matches[
+            event_matches["event_date"].notna()
+            & (event_matches["event_date"] >= date_start)
+            & (event_matches["event_date"] <= date_end)
+        ]
+
+    if F["event"] != "All":
+        event_matches = apply_exact_filter(
+            event_matches,
+            "luma_event_name",
+            F["event"],
+        )
+
+    if F["event_type"] != "All":
+        event_matches = apply_exact_filter(
+            event_matches,
+            "luma_event_type",
+            F["event_type"],
+        )
+
+    if F["event_mode"] != "All":
+        event_matches = apply_exact_filter(
+            event_matches,
+            "event_mode",
+            F["event_mode"],
+        )
+
+    event_keys = set(
+        event_matches["person_key"].dropna().astype(str)
+    )
+
+    filtered_people = filtered_people[
+        filtered_people["person_key"].astype(str).isin(event_keys)
+    ]
+
+# Search applies only after Apply Filters.
+if F["search"]:
+    q = F["search"].lower()
+    search_cols = [
+        "FirstName",
+        "LastName",
+        "Email",
+        "Phone",
+        "Linkedin",
+        "About",
+        "Company Name",
+        "Reason to join our event",
+        "Are You?",
+        "Data Source",
+        "City Clean",
+        "Designation Clean",
+    ]
+
+    mask = pd.Series(False, index=filtered_people.index)
+
+    for col in search_cols:
+        if col in filtered_people.columns:
+            mask |= (
+                filtered_people[col]
+                .fillna("")
+                .astype(str)
+                .str.lower()
+                .str.contains(q, regex=False, na=False)
+            )
+
+    filtered_people = filtered_people[mask]
+
+
+# ============================================================
+# OVERVIEW
+# ============================================================
+
+def bool_count(df, col):
+    return int(df[col].fillna(False).astype(bool).sum()) if col in df.columns else 0
+
+st.markdown('<div class="section-title">📈 Unique People Overview</div>', unsafe_allow_html=True)
+
+c1, c2, c3, c4 = st.columns(4)
+with c1: metric_card("Total Unique People", len(people_df))
+with c2: metric_card("Founders", bool_count(people_df, "is_founder"))
+with c3: metric_card("Investors", bool_count(people_df, "is_investor"))
+with c4: metric_card("Students / Intern", bool_count(people_df, "is_student_intern"))
+
+c5, c6, c7, c8 = st.columns(4)
+with c5: metric_card("Professionals", bool_count(people_df, "is_professional"))
+with c6: metric_card("Senior Leadership", bool_count(people_df, "is_senior_leadership"))
+with c7: metric_card("Director / VP", bool_count(people_df, "is_director_vp"))
+with c8: metric_card("Other / Blank", bool_count(people_df, "is_other_blank"))
+
+st.markdown('<div class="section-title">🔎 Filtered Results</div>', unsafe_allow_html=True)
+metric_card("Matching Unique Users", len(filtered_people))
+
+active = []
+for label, key in [
+    ("Category", "category"),
+    ("Event", "event"),
+    ("Event Type", "event_type"),
+    ("Event Mode", "event_mode"),
+    ("City", "city"),
+    ("Email Domain", "domain"),
+]:
+    if F[key] != "All":
+        active.append(f"{label}: {F[key]}")
+
+if F["date_mode"] != "All Dates":
+    if (
+        F["date_mode"] == "Custom Date Range"
+        and F["custom_dates"]
+        and isinstance(F["custom_dates"], (tuple, list))
+        and len(F["custom_dates"]) == 2
+    ):
+        active.append(
+            f"Event Date: {F['custom_dates'][0]} to {F['custom_dates'][1]}"
+        )
+    else:
+        active.append(f"Event Date: {F['date_mode']}")
+
+if F["search"]:
+    active.append(f"Search: {F['search']}")
+
+if active:
+    st.info("Applied filters → " + " | ".join(active))
+
+# ============================================================
+# TABLE
+# ============================================================
+
+rows_per_page = st.selectbox("Rows per page", [25, 50, 100, 250], index=1)
+total_pages = max(1, math.ceil(len(filtered_people) / rows_per_page))
+page = st.number_input("Page", min_value=1, max_value=total_pages, value=1, step=1)
+start = (page - 1) * rows_per_page
+page_df = filtered_people.iloc[start:start + rows_per_page].copy()
+
+# Keep CEO-requested names, but City/Designation now display cleaned main values.
+page_df["City"] = page_df["City Clean"]
+page_df["Designation"] = page_df["Designation Clean"]
+
+# CEO-facing category display:
+# If a specific Category filter is applied, show ONLY that selected
+# category in the "Are You?" column. The underlying multi-category
+# membership flags remain unchanged for correct cross-category filtering.
+if F["category"] != "All" and "Are You?" in page_df.columns:
+    page_df["Are You?"] = F["category"]
+
+DISPLAY_COLUMNS = [
+    "FirstName", "LastName", "Event Date", "Email", "Phone", "Linkedin",
+    "About", "City", "Designation", "Company Name", "Reason to join our event",
+    "Valid Email", "Luma Event Name", "Luma Event Type", "Event Mode",
+    "source_spreadsheet_url", "Are You?", "event_date", "Data Source",
+]
+DISPLAY_COLUMNS = [c for c in DISPLAY_COLUMNS if c in page_df.columns]
+
+st.caption(f"Page {page} of {total_pages} • Showing {len(page_df):,} unique people")
+st.dataframe(page_df[DISPLAY_COLUMNS], use_container_width=True, hide_index=True)
+
+# ============================================================
+# DOWNLOAD — SELECTIVE COLUMNS WITH CHECKBOXES
+# ============================================================
+
+st.markdown(
+    '<div class="section-title">📥 Download Filtered Data</div>',
+    unsafe_allow_html=True,
+)
+
+export_df = filtered_people.copy()
+export_df["City"] = export_df["City Clean"]
+export_df["Designation"] = export_df["Designation Clean"]
+
+if F["category"] != "All" and "Are You?" in export_df.columns:
+    export_df["Are You?"] = F["category"]
+
+DOWNLOADABLE_COLUMNS = [
+    "FirstName",
+    "LastName",
+    "Event Date",
+    "Email",
+    "Phone",
+    "Linkedin",
+    "About",
+    "City",
+    "Designation",
+    "Company Name",
+    "Reason to join our event",
+    "Valid Email",
+    "Luma Event Name",
+    "Luma Event Type",
+    "Event Mode",
+    "source_spreadsheet_url",
+    "Are You?",
+    "event_date",
+    "Data Source",
+]
+
+DOWNLOADABLE_COLUMNS = [
+    c for c in DOWNLOADABLE_COLUMNS
+    if c in export_df.columns
+]
+
+st.caption("Select only the columns you want in the downloaded files.")
+
+with st.expander("✅ Choose Download Columns", expanded=True):
+
+    default_selected = {
+        "FirstName",
+        "LastName",
+        "Email",
+        "Phone",
+    }
+
+    selected_download_columns = []
+    checkbox_cols = st.columns(4)
+
+    for i, col in enumerate(DOWNLOADABLE_COLUMNS):
+        with checkbox_cols[i % 4]:
+            checked = st.checkbox(
+                col,
+                value=(col in default_selected),
+                key=f"download_col_{re.sub(r'[^a-zA-Z0-9_]+', '_', col)}",
+            )
+            if checked:
+                selected_download_columns.append(col)
+
+if not selected_download_columns:
+    st.warning("Select at least one column to enable downloads.")
+else:
+    download_df = export_df[selected_download_columns].copy()
+
+    x1, x2 = st.columns(2)
+
+    with x1:
+        excel_data = make_excel(download_df, "Unified People")
+        st.download_button(
+            "⬇️ Download Excel (.xlsx)",
+            data=excel_data,
+            file_name="hidevs_unified_people_filtered.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True,
+        )
+
+    with x2:
+        csv_data = download_df.to_csv(index=False).encode("utf-8-sig")
+        st.download_button(
+            "⬇️ Download CSV (.csv)",
+            data=csv_data,
+            file_name="hidevs_unified_people_filtered.csv",
+            mime="text/csv",
+            use_container_width=True,
+        )
+
+
+st.markdown(
+    '<div class="footer">HiDevs Data Explorer • Unified Luma + Master • Unique People Only</div>',
     unsafe_allow_html=True,
 )
