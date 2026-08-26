@@ -1315,6 +1315,47 @@ if F["search"]:
 if active:
     st.info("Applied filters → " + " | ".join(active))
 
+
+# ============================================================
+# CATEGORY-BASED DESIGNATION FALLBACK
+# ============================================================
+
+CATEGORY_DESIGNATION_FALLBACK = {
+    "Founder": "Founder",
+    "Investor": "Investor",
+    "Student / Intern": "Student / Intern",
+    "Professional": "Professional",
+    "Senior Leadership / C-Suite": "Senior Leadership / C-Suite",
+    "Director / VP / Senior Professional": "Director / VP / Senior Professional",
+}
+
+def apply_category_designation_fallback(df, selected_category):
+    """
+    CEO-facing designation display rule:
+    When a specific Category is selected, force the displayed/exported
+    Designation to that selected category for every matching row.
+
+    Examples:
+      Founder -> Designation = Founder
+      Investor -> Designation = Investor
+      Student / Intern -> Designation = Student / Intern
+      Professional -> Designation = Professional
+
+    The original/raw Designation values remain untouched in Supabase.
+    """
+    result = df.copy()
+
+    if (
+        selected_category == "All"
+        or selected_category not in CATEGORY_DESIGNATION_FALLBACK
+        or "Designation" not in result.columns
+    ):
+        return result
+
+    result["Designation"] = CATEGORY_DESIGNATION_FALLBACK[selected_category]
+    return result
+
+
 # ============================================================
 # TABLE
 # ============================================================
@@ -1329,6 +1370,13 @@ page_df = filtered_people.iloc[start:start + rows_per_page].copy()
 page_df["City"] = page_df["City Clean"]
 page_df["Designation"] = page_df["Designation Clean"]
 
+# If cleaned Designation is missing, use the selected Category as fallback.
+# Example: Category = Founder + Designation = Not Specified -> Founder.
+page_df = apply_category_designation_fallback(
+    page_df,
+    F["category"],
+)
+
 # CEO-facing category display:
 # If a specific Category filter is applied, show ONLY that selected
 # category in the "Are You?" column. The underlying multi-category
@@ -1338,8 +1386,7 @@ if F["category"] != "All" and "Are You?" in page_df.columns:
 
 DISPLAY_COLUMNS = [
     "FirstName", "LastName", "Event Date", "Email", "Phone", "Linkedin",
-    "About", "City", "Designation", "Company Name", "Reason to join our event",
-    "Valid Email", "Luma Event Name", "Luma Event Type", "Event Mode",
+    "About", "City", "Designation", "Company Name", "Reason to join our event", "Luma Event Name", "Luma Event Type", "Event Mode",
     "source_spreadsheet_url", "Are You?", "event_date", "Data Source",
 ]
 DISPLAY_COLUMNS = [c for c in DISPLAY_COLUMNS if c in page_df.columns]
@@ -1360,6 +1407,12 @@ export_df = filtered_people.copy()
 export_df["City"] = export_df["City Clean"]
 export_df["Designation"] = export_df["Designation Clean"]
 
+# Apply the same category-based designation fallback to downloads.
+export_df = apply_category_designation_fallback(
+    export_df,
+    F["category"],
+)
+
 if F["category"] != "All" and "Are You?" in export_df.columns:
     export_df["Are You?"] = F["category"]
 
@@ -1375,7 +1428,6 @@ DOWNLOADABLE_COLUMNS = [
     "Designation",
     "Company Name",
     "Reason to join our event",
-    "Valid Email",
     "Luma Event Name",
     "Luma Event Type",
     "Event Mode",
