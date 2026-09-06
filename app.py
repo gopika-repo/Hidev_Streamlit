@@ -1,9 +1,11 @@
 import math
 import re
+import time
 import unicodedata
 from datetime import date
 
 import geonamescache
+import httpx
 import pandas as pd
 import streamlit as st
 from supabase import create_client
@@ -61,12 +63,12 @@ FETCH_BATCH_SIZE = 1000
 
 DB_COLUMNS = [
     "first_name",
+    "last_name",
     "email",
     "linkedin",
     "city",
     "designation",
     "designation_category",
-    "last_name",
     "phone",
     "source_tab",
     "source_spreadsheet",
@@ -148,6 +150,33 @@ def normalize_text(value):
     )
 
     return value.casefold().strip()
+
+
+# ============================================================
+# DISPLAY-ONLY LABEL HELPERS
+# DATABASE VALUES ARE NOT MODIFIED
+# ============================================================
+
+CATEGORY_SOURCE_DISPLAY_MAP = {
+    "real_designation_clear": "Designation",
+    "strong_are_you_evidence": "Are You",
+}
+
+
+def display_category_source(value):
+    key = normalize_text(value).replace("-", "_").replace(" ", "_")
+    return CATEGORY_SOURCE_DISPLAY_MAP.get(key, clean_text(value))
+
+
+def is_luma_not_verified_row(row):
+    source_table = normalize_text(row.get("_source_table"))
+    source_tab = normalize_text(row.get("source_tab")).replace("-", " ")
+
+    return (
+        source_table == "luma_not_verified_designation"
+        or "luma not verified designation" in source_tab
+        or "not verified designation" in source_tab
+    )
 
 
 def split_multi_value(value, separator=";"):
@@ -339,16 +368,16 @@ def applied_selection(bucket):
 # so it is not shown in this filter. Raw source values are still normalized
 # internally so existing data remains compatible.
 DESIGNATION_CATEGORY_OPTIONS = [
-    "Founders",
+    "Founder",
     "C-Suite",
-    "Investors",
-    "StudentsInterns",
-    "DirectorVPHead",
-    "Professionals",
+    "Investor",
+    "Student/Intern",
+    "Director/VP/Head",
+    "Professional",
     "HR",
     "Community",
     "Others",
-    "Not Mentiones",
+    "Not Mentioned",
     "Unverified Users",
 ]
 
@@ -364,7 +393,7 @@ def normalize_category(value):
     key = normalize_text(raw)
 
     if not key:
-        return "Not Mentiones"
+        return "Not Mentioned"
 
     compact = re.sub(r"[^a-z0-9]+", " ", key).strip()
 
@@ -377,32 +406,32 @@ def normalize_category(value):
         "unverified users": "Unverified Users",
         "unverified user": "Unverified Users",
 
-        "founder": "Founders",
-        "founders": "Founders",
-        "founder co founder": "Founders",
-        "founder cofounder": "Founders",
-        "co founder": "Founders",
-        "cofounder": "Founders",
+        "founder": "Founder",
+        "founders": "Founder",
+        "founder co founder": "Founder",
+        "founder cofounder": "Founder",
+        "co founder": "Founder",
+        "cofounder": "Founder",
 
         "c suite": "C-Suite",
         "senior leadership c suite": "C-Suite",
         "senior leadership": "C-Suite",
 
-        "investor": "Investors",
-        "investors": "Investors",
+        "investor": "Investor",
+        "investors": "Investor",
 
-        "student": "StudentsInterns",
-        "students": "StudentsInterns",
-        "student intern": "StudentsInterns",
-        "students interns": "StudentsInterns",
+        "student": "Student/Intern",
+        "students": "Student/Intern",
+        "student intern": "Student/Intern",
+        "students interns": "Student/Intern",
 
-        "director vp head": "DirectorVPHead",
-        "director vp senior professional": "DirectorVPHead",
+        "director vp head": "Director/VP/Head",
+        "director vp senior professional": "Director/VP/Head",
 
-        "professional": "Professionals",
-        "professionals": "Professionals",
-        "individual contributor professional": "Professionals",
-        "other professional roles": "Professionals",
+        "professional": "Professional",
+        "professionals": "Professional",
+        "individual contributor professional": "Professional",
+        "other professional roles": "Professional",
 
         "hr": "HR",
         "human resources": "HR",
@@ -417,15 +446,15 @@ def normalize_category(value):
         "professors": "Others",
         "faculty": "Others",
 
-        "not mentioned": "Not Mentiones",
-        "not mention": "Not Mentiones",
-        "not mentiones": "Not Mentiones",
-        "unknown": "Not Mentiones",
-        "none": "Not Mentiones",
-        "null": "Not Mentiones",
-        "na": "Not Mentiones",
-        "n a": "Not Mentiones",
-        "blank": "Not Mentiones",
+        "not mentioned": "Not Mentioned",
+        "not mention": "Not Mentioned",
+        "not mentiones": "Not Mentioned",
+        "unknown": "Not Mentioned",
+        "none": "Not Mentioned",
+        "null": "Not Mentioned",
+        "na": "Not Mentioned",
+        "n a": "Not Mentioned",
+        "blank": "Not Mentioned",
     }
 
     if compact in exact_aliases:
@@ -439,12 +468,12 @@ def normalize_category(value):
     if any(x in compact for x in [
         "founder", "co founder", "cofounder"
     ]):
-        return "Founders"
+        return "Founder"
 
     if any(x in compact for x in [
         "investor", "venture capital", "angel investor"
     ]):
-        return "Investors"
+        return "Investor"
 
     # C-Suite only for explicit chief / CXO signals. Do NOT use plain VP here.
     if any(x in compact for x in [
@@ -465,13 +494,13 @@ def normalize_category(value):
         or "department head" in compact
         or "business head" in compact
     ):
-        return "DirectorVPHead"
+        return "Director/VP/Head"
 
     if any(x in compact for x in [
         "student", "intern", "internship", "college engineer",
         "college student", "university student"
     ]):
-        return "StudentsInterns"
+        return "Student/Intern"
 
     if (
         "hr" in tokens
@@ -492,13 +521,13 @@ def normalize_category(value):
         "software engineer", "developer", "engineer", "consultant",
         "analyst", "designer", "manager"
     ]):
-        return "Professionals"
+        return "Professional"
 
     if any(x in compact for x in [
         "not mentioned", "not mention", "not mentiones", "unknown",
         "none", "null", "blank"
     ]):
-        return "Not Mentiones"
+        return "Not Mentioned"
 
     if any(x in compact for x in [
         "other", "professor", "faculty", "volunteer"
@@ -525,7 +554,7 @@ def get_dashboard_category(row):
     raw_category = clean_text(row.get("designation_category"))
     if raw_category:
         normalized = normalize_category(raw_category)
-        if normalized != "Not Mentiones":
+        if normalized != "Not Mentioned":
             return normalized
 
     # For rows without a designation category, use Are You? as a safe
@@ -533,7 +562,7 @@ def get_dashboard_category(row):
     are_you = clean_text(row.get("are_you"))
     if are_you:
         normalized = normalize_category(are_you)
-        if normalized not in {"Not Mentiones", "Others"}:
+        if normalized not in {"Not Mentioned", "Others"}:
             return normalized
 
     # Last fallback: designation text itself. This still returns only one
@@ -541,10 +570,10 @@ def get_dashboard_category(row):
     designation = clean_text(row.get("designation"))
     if designation:
         normalized = normalize_category(designation)
-        if normalized != "Not Mentiones":
+        if normalized != "Not Mentioned":
             return normalized
 
-    return "Not Mentiones"
+    return "Not Mentioned"
 
 
 # ============================================================
@@ -552,26 +581,52 @@ def get_dashboard_category(row):
 # ============================================================
 
 @st.cache_data(
-    ttl=600,
+    ttl=1800,
     show_spinner=False
 )
 def fetch_all_rows(table_name, columns):
+    """Fetch a complete Supabase table safely in paginated batches.
+
+    Transient HTTP disconnects can happen while Streamlit is loading a large
+    dataset. Retry the same batch automatically instead of crashing the app.
+    """
 
     all_rows = []
     start = 0
+    max_retries = 5
+
+    retryable_errors = (
+        httpx.RemoteProtocolError,
+        httpx.ConnectError,
+        httpx.ReadError,
+        httpx.ReadTimeout,
+        httpx.ConnectTimeout,
+    )
 
     while True:
 
-        response = (
-            supabase
-            .table(table_name)
-            .select(",".join(columns))
-            .range(
-                start,
-                start + FETCH_BATCH_SIZE - 1
-            )
-            .execute()
-        )
+        response = None
+
+        for attempt in range(1, max_retries + 1):
+
+            try:
+                response = (
+                    supabase
+                    .table(table_name)
+                    .select(",".join(columns))
+                    .range(
+                        start,
+                        start + FETCH_BATCH_SIZE - 1
+                    )
+                    .execute()
+                )
+                break
+
+            except retryable_errors:
+                if attempt == max_retries:
+                    raise
+
+                time.sleep(attempt * 2)
 
         rows = response.data or []
         all_rows.extend(rows)
@@ -613,6 +668,14 @@ USER_EVENT_COLUMNS = [
     "is_registered",
     "checked_in",
     "checked_in_at",
+]
+
+# Lightweight columns used to build each person's complete normalized event
+# history in the unfiltered dashboard. Event dates are then shown in the same
+# order as the event names, so the Nth date always belongs to the Nth event.
+USER_EVENT_HISTORY_COLUMNS = [
+    "event_id",
+    "email",
 ]
 
 IDENTITY_COLUMNS = [
@@ -680,6 +743,138 @@ def load_identity_map():
     frame["alias_email"] = frame["alias_email"].apply(normalize_email)
     frame["canonical_email"] = frame["canonical_email"].apply(normalize_email)
     return frame
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def load_normalized_event_history(identity_df, event_master_df):
+    """Build exact event-name/date history for every canonical Luma identity.
+
+    One luma_user_events relationship is tied to one event_id. By joining those
+    event_ids to luma_event_master first, the event names and dates stay aligned.
+    The grouped strings are chronological and use the same separator/order:
+
+        Luma Event Name: Event A; Event B; Event C
+        event_date:      01-01-2026; 05-02-2026; 19-03-2026
+
+    Therefore each date position corresponds to the event at the same position.
+    """
+
+    history_columns = [
+        "_canonical_email",
+        "_history_event_names",
+        "_history_event_dates",
+        "_history_event_types",
+        "_history_event_modes",
+    ]
+
+    if event_master_df is None or event_master_df.empty:
+        return pd.DataFrame(columns=history_columns)
+
+    relationships = fetch_all_rows(
+        USER_EVENTS_TABLE,
+        tuple(USER_EVENT_HISTORY_COLUMNS),
+    )
+
+    if relationships.empty:
+        return pd.DataFrame(columns=history_columns)
+
+    for col in USER_EVENT_HISTORY_COLUMNS:
+        if col not in relationships.columns:
+            relationships[col] = None
+
+    identity_lookup = {}
+    if identity_df is not None and not identity_df.empty:
+        for _, row in identity_df.iterrows():
+            alias = normalize_email(row.get("alias_email"))
+            canonical = normalize_email(row.get("canonical_email"))
+            if alias and canonical:
+                identity_lookup[alias] = canonical
+
+    relationships["_email_clean"] = relationships["email"].apply(normalize_email)
+    relationships["_canonical_email"] = relationships["_email_clean"].apply(
+        lambda x: resolve_identity(x, identity_lookup)
+    )
+
+    relationships = relationships[
+        relationships["_canonical_email"].fillna("").astype(str).str.strip().ne("")
+    ].copy()
+
+    if relationships.empty:
+        return pd.DataFrame(columns=history_columns)
+
+    master_cols = [
+        "event_id",
+        "event_name",
+        "event_type",
+        "event_mode",
+        "_event_date",
+    ]
+    master = event_master_df[[c for c in master_cols if c in event_master_df.columns]].copy()
+
+    for col in master_cols:
+        if col not in master.columns:
+            master[col] = None
+
+    merged = relationships.merge(
+        master[master_cols],
+        on="event_id",
+        how="left",
+        sort=False,
+    )
+
+    # One canonical person + one event occurrence should appear only once in
+    # the history even if defensive duplicate rows ever reach the client.
+    merged = merged.drop_duplicates(
+        subset=["_canonical_email", "event_id"],
+        keep="first",
+    )
+
+    merged["_sort_date"] = pd.to_datetime(
+        merged["_event_date"],
+        errors="coerce",
+    )
+
+    merged = merged.sort_values(
+        ["_canonical_email", "_sort_date", "event_id"],
+        ascending=[True, True, True],
+        na_position="last",
+        kind="stable",
+    )
+
+    def joined_history(group, column, formatter=None):
+        values = []
+        for value in group[column]:
+            if formatter is not None:
+                value = formatter(value)
+            else:
+                value = clean_text(value)
+            values.append(value or "None")
+        return "; ".join(values)
+
+    rows = []
+    for canonical_email, group in merged.groupby("_canonical_email", sort=False):
+        event_names = joined_history(
+            group,
+            "event_name",
+            lambda x: clean_event_label(x) or "Unnamed Event",
+        )
+        event_dates = joined_history(
+            group,
+            "_event_date",
+            lambda x: x.strftime("%d-%m-%Y") if pd.notna(x) else "Date unknown",
+        )
+        event_types = joined_history(group, "event_type")
+        event_modes = joined_history(group, "event_mode")
+
+        rows.append({
+            "_canonical_email": canonical_email,
+            "_history_event_names": event_names,
+            "_history_event_dates": event_dates,
+            "_history_event_types": event_types,
+            "_history_event_modes": event_modes,
+        })
+
+    return pd.DataFrame(rows, columns=history_columns)
 
 
 def load_profile_join_data(identity_df):
@@ -776,16 +971,37 @@ def fetch_event_relationships(event_ids):
         start = 0
 
         while True:
-            response = (
-                supabase
-                .table(USER_EVENTS_TABLE)
-                .select(",".join(USER_EVENT_COLUMNS))
-                .in_("event_id", chunk)
-                .order("event_id", desc=False)
-                .order("guest_id", desc=False)
-                .range(start, start + FETCH_BATCH_SIZE - 1)
-                .execute()
+            response = None
+            max_retries = 5
+
+            retryable_errors = (
+                httpx.RemoteProtocolError,
+                httpx.ConnectError,
+                httpx.ReadError,
+                httpx.ReadTimeout,
+                httpx.ConnectTimeout,
             )
+
+            for attempt in range(1, max_retries + 1):
+
+                try:
+                    response = (
+                        supabase
+                        .table(USER_EVENTS_TABLE)
+                        .select(",".join(USER_EVENT_COLUMNS))
+                        .in_("event_id", chunk)
+                        .order("event_id", desc=False)
+                        .order("guest_id", desc=False)
+                        .range(start, start + FETCH_BATCH_SIZE - 1)
+                        .execute()
+                    )
+                    break
+
+                except retryable_errors:
+                    if attempt == max_retries:
+                        raise
+
+                    time.sleep(attempt * 2)
 
             rows = response.data or []
             all_rows.extend(rows)
@@ -1689,7 +1905,24 @@ def build_event_label_maps(master_df):
     return label_to_id, id_to_label
 
 
-EVENT_LABEL_TO_ID, EVENT_ID_TO_LABEL = build_event_label_maps(event_master_df)
+# Events confirmed by the Luma API to have zero guest/user relationships.
+# Keep them in luma_event_master for historical accuracy, but hide them from
+# the interactive "Luma Event" filter because selecting them can never return users.
+ZERO_USER_EVENT_IDS = {
+    "evt-1OsMC6h0uq2HdDg",  # Building Digital Clones - Workshop + Hackathon - 2025-04-12
+    "evt-X74faDGjYuETatW",  # AI Agent Portfolio Sprint - 2026-07-28
+    "evt-b2L8V2ScjResj0a",  # AI Engineering Career Accelerator - 2026-07-28
+    "evt-DGW6cmcfMeAmTj2",  # Secure Your Agent - 2026-07-28
+    "evt-DvxAzatHFn0gQCC",  # Token Economics - 2026-07-29
+    "evt-A93sRzlynWFCHeg",  # Building Reliable Coding Agents - 2026-07-31
+    "evt-ZB5htC4FHHFjfGu",  # Stop Hallucinations - 2026-07-31
+}
+
+filterable_event_master_df = event_master_df[
+    ~event_master_df["event_id"].fillna("").astype(str).isin(ZERO_USER_EVENT_IDS)
+].copy()
+
+EVENT_LABEL_TO_ID, EVENT_ID_TO_LABEL = build_event_label_maps(filterable_event_master_df)
 
 
 # ============================================================
@@ -1738,6 +1971,55 @@ def add_unified_identity_columns(frame):
 df = add_unified_identity_columns(df)
 
 
+# ============================================================
+# NORMALIZED PER-PERSON EVENT HISTORY
+# ============================================================
+# The old profile tables contain semicolon-separated event names but only one
+# legacy event_date value. Replace that display history with the authoritative
+# event_id-based history from luma_user_events + luma_event_master.
+#
+# Important: event names, dates, types and modes are aggregated in the same
+# chronological order. If a user has 5 event names, the event_date cell has 5
+# matching dates in the same positions. A one-event user receives one date.
+normalized_event_history_df = load_normalized_event_history(
+    identity_map_df,
+    event_master_df,
+)
+
+if not normalized_event_history_df.empty:
+    df = df.merge(
+        normalized_event_history_df,
+        on="_canonical_email",
+        how="left",
+        sort=False,
+    )
+
+    has_normalized_history = (
+        df["_history_event_names"]
+        .fillna("")
+        .astype(str)
+        .str.strip()
+        .ne("")
+    )
+
+    df.loc[has_normalized_history, "luma_event_name"] = (
+        df.loc[has_normalized_history, "_history_event_names"]
+    )
+    df.loc[has_normalized_history, "event_date"] = (
+        df.loc[has_normalized_history, "_history_event_dates"]
+    )
+    df.loc[has_normalized_history, "event_type"] = (
+        df.loc[has_normalized_history, "_history_event_types"]
+    )
+    df.loc[has_normalized_history, "event_mode"] = (
+        df.loc[has_normalized_history, "_history_event_modes"]
+    )
+
+    df["_has_normalized_event_history"] = has_normalized_history
+else:
+    df["_has_normalized_event_history"] = False
+
+
 def rebuild_filter_helpers(frame):
     out = frame.copy()
 
@@ -1755,9 +2037,18 @@ def rebuild_filter_helpers(frame):
     if "_canonical_email" not in out.columns:
         out = add_unified_identity_columns(out)
 
+    if "_has_normalized_event_history" not in out.columns:
+        out["_has_normalized_event_history"] = False
+
     if "_event_date" not in out.columns:
+        # Only legacy single-date rows are parsed here. Normalized multi-event
+        # histories are already represented as an aligned semicolon date list.
+        legacy_dates = out["event_date"].where(
+            ~out["_has_normalized_event_history"].fillna(False).astype(bool),
+            None,
+        )
         out["_event_date"] = pd.to_datetime(
-            out["event_date"],
+            legacy_dates,
             errors="coerce",
             utc=True,
         ).dt.date
@@ -2089,7 +2380,30 @@ def normalized_master_filter_options(frame, column):
     return sorted(values, key=normalize_text) + ["None"]
 
 
-EVENT_TYPE_OPTIONS = normalized_master_filter_options(event_master_df, "event_type")
+# Hide event types that should not appear in the dashboard filter.
+# The values remain unchanged in Supabase/luma_event_master; this is UI-only.
+HIDDEN_EVENT_TYPES = {
+    "Bootcamp",
+    "Giveaway",
+    "Networking",
+    "Orientation",
+    "Program",
+    "Product / Startup Session",
+    "Sprint",
+    "Talk / Session",
+}
+
+_hidden_event_type_keys = {
+    normalize_text(value).replace(" / ", "/")
+    for value in HIDDEN_EVENT_TYPES
+}
+
+EVENT_TYPE_OPTIONS = [
+    value
+    for value in normalized_master_filter_options(event_master_df, "event_type")
+    if normalize_text(value).replace(" / ", "/") not in _hidden_event_type_keys
+]
+
 EVENT_MODE_OPTIONS = normalized_master_filter_options(event_master_df, "event_mode")
 CITY_REGION_OPTIONS = ["India", "Abroad"]
 
@@ -2486,14 +2800,14 @@ if selected_event_ids:
             st.write("Event Mode:", clean_text(selected_meta_row.get("event_mode")) or "None")
 
     with st.expander("Event source audit"):
+        # Founder-facing audit: show each relationship metric once and use the
+        # simple label "Unique Users" for identity-resolved people.
         audit_df = pd.DataFrame([
             {"Metric": "Guest-list relationships", "Count": event_audit.get("guest_rows", 0)},
             {"Metric": "Registered relationships", "Count": event_audit.get("registered_rows", 0)},
             {"Metric": "Attended relationships", "Count": event_audit.get("attended_rows", 0)},
             {"Metric": "Invited-only relationships", "Count": event_audit.get("invited_only_rows", 0)},
-            {"Metric": f"Selected audience relationships ({event_audience})", "Count": event_audit.get("audience_relationships", 0)},
-            {"Metric": "Unique people across selected events", "Count": event_audit.get("canonical_users", 0)},
-            {"Metric": "Person-event rows", "Count": event_audit.get("event_user_rows", 0)},
+            {"Metric": "Unique Users", "Count": event_audit.get("canonical_users", 0)},
         ])
 
         st.dataframe(
@@ -2514,13 +2828,11 @@ if selected_event_ids:
                 "registered_rows": "Registered",
                 "attended_rows": "Attended",
                 "invited_only_rows": "Invited Only",
-                "selected_relationships": f"Selected ({event_audience})",
-                "canonical_users": "Canonical Users",
+                "canonical_users": "Unique Users",
             })
             keep_cols = [
                 "Event", "Date", "Type", "Mode", "Guest List", "Registered",
-                "Attended", "Invited Only", f"Selected ({event_audience})",
-                "Canonical Users",
+                "Attended", "Invited Only", "Unique Users",
             ]
             st.dataframe(
                 coverage[[c for c in keep_cols if c in coverage.columns]],
@@ -2659,17 +2971,72 @@ else:
 
     # Friendly Event Date
     if selected_event_ids:
-        # Already built from luma_event_master; may contain multiple selected dates.
+        # Selected-event mode always contains the exact single occurrence date
+        # from luma_event_master for that person-event row.
         result_df["event_date"] = page_df["event_date"].fillna("").astype(str)
     else:
-        result_df["event_date"] = (
-            page_df["_event_date"]
-            .apply(
-                lambda x:
-                x.strftime("%d-%m-%Y")
-                if pd.notna(x)
-                else ""
+        # General mode may contain many Luma events for the same user. When
+        # normalized event history is available, event_date is already an aligned
+        # semicolon list (one date for each Luma Event Name, same order).
+        normalized_history_mask = (
+            page_df.get(
+                "_has_normalized_event_history",
+                pd.Series(False, index=page_df.index),
             )
+            .fillna(False)
+            .astype(bool)
+        )
+
+        result_df["event_date"] = page_df["event_date"].fillna("").astype(str)
+
+        legacy_mask = ~normalized_history_mask
+        if legacy_mask.any():
+            result_df.loc[legacy_mask, "event_date"] = (
+                page_df.loc[legacy_mask, "_event_date"]
+                .apply(
+                    lambda x:
+                    x.strftime("%d-%m-%Y")
+                    if pd.notna(x)
+                    else ""
+                )
+            )
+
+
+    # --------------------------------------------------------
+    # DISPLAY-ONLY DESIGNATION / CATEGORY SOURCE LABELS
+    # --------------------------------------------------------
+
+    # The database intentionally stores a blank designation for
+    # luma_not_verified_designation rows. For founder-facing display,
+    # show the historical label "Not Verified" instead of an empty cell.
+    if "designation" in result_df.columns:
+        blank_designation = (
+            result_df["designation"]
+            .fillna("")
+            .astype(str)
+            .str.strip()
+            .eq("")
+        )
+        not_verified_source = page_df.apply(
+            is_luma_not_verified_row,
+            axis=1,
+        )
+        result_df.loc[
+            blank_designation & not_verified_source,
+            "designation",
+        ] = "Not Verified"
+
+    # Display the SAME normalized designation-category label used by the
+    # filter. Do not expose raw Supabase labels such as "Founder/Co-Founder"
+    # when the dashboard category is simply "Founder".
+    if "designation_category" in result_df.columns:
+        result_df["designation_category"] = page_df["_category_filter"].fillna("Not Mentioned")
+
+    # Replace internal classification-source codes with clean UI labels.
+    if "category_source" in result_df.columns:
+        result_df["category_source"] = (
+            result_df["category_source"]
+            .apply(display_category_source)
         )
 
 
@@ -2837,15 +3204,56 @@ if selected_download_columns:
         if selected_event_ids:
             download_df["event_date"] = filtered["event_date"].fillna("").astype(str)
         else:
-            download_df["event_date"] = (
-                filtered["_event_date"]
-                .apply(
-                    lambda x:
-                    x.strftime("%d-%m-%Y")
-                    if pd.notna(x)
-                    else ""
+            normalized_history_mask = (
+                filtered.get(
+                    "_has_normalized_event_history",
+                    pd.Series(False, index=filtered.index),
                 )
+                .fillna(False)
+                .astype(bool)
             )
+
+            download_df["event_date"] = filtered["event_date"].fillna("").astype(str)
+
+            legacy_mask = ~normalized_history_mask
+            if legacy_mask.any():
+                download_df.loc[legacy_mask, "event_date"] = (
+                    filtered.loc[legacy_mask, "_event_date"]
+                    .apply(
+                        lambda x:
+                        x.strftime("%d-%m-%Y")
+                        if pd.notna(x)
+                        else ""
+                    )
+                )
+
+
+    # Keep downloaded data consistent with what is shown in the dashboard.
+    if "designation" in download_df.columns:
+        blank_designation = (
+            download_df["designation"]
+            .fillna("")
+            .astype(str)
+            .str.strip()
+            .eq("")
+        )
+        not_verified_source = filtered.apply(
+            is_luma_not_verified_row,
+            axis=1,
+        )
+        download_df.loc[
+            blank_designation & not_verified_source,
+            "designation",
+        ] = "Not Verified"
+
+    if "designation_category" in download_df.columns:
+        download_df["designation_category"] = filtered["_category_filter"].fillna("Not Mentioned")
+
+    if "category_source" in download_df.columns:
+        download_df["category_source"] = (
+            download_df["category_source"]
+            .apply(display_category_source)
+        )
 
 
     download_df.rename(
